@@ -4,7 +4,7 @@ import scipy
 import pandas as pd
 import numpy as np
 import hydra
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from scipy import signal
 import logging
 import matplotlib.pyplot as plt
@@ -27,6 +27,7 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 import optuna
 from my_optuna import objective
 import json
+import hashlib
 from skimage.transform import resize
 import torch.distributed as dist
 from sklearn.model_selection import KFold, train_test_split
@@ -61,6 +62,89 @@ def resolve_trainer_strategy(devices):
     if isinstance(devices, (list, tuple)):
         return "ddp_find_unused_parameters_true" if len(devices) > 1 else "auto"
     return "auto"
+
+
+
+def _cfg_get(cfg, key, default=None):
+    return cfg.get(key, default) if hasattr(cfg, "get") else default
+
+
+def get_artifact_root(cfg):
+    artifacts_cfg = _cfg_get(cfg, "artifacts", {}) or {}
+    return Path(artifacts_cfg.get("output_dir", "artifacts"))
+
+
+def build_preprocess_cache_path(cfg, dataset_tag):
+    cache_cfg = _cfg_get(cfg, "cache", {}) or {}
+    cache_dir = Path(cache_cfg.get("dir", cfg.data_dir))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    signature_payload = {
+        "dataset_tag": dataset_tag,
+        "data_path": cfg.data.path,
+        "preprocessing": OmegaConf.to_container(cfg.preprocessing, resolve=True),
+        "window_size": cfg.training.window_size,
+        "overlap": cfg.training.overlap,
+        "n_freq_bins": cfg.training.n_freq_bins,
+    }
+    payload_str = json.dumps(signature_payload, sort_keys=True, default=str)
+    cache_key = hashlib.md5(payload_str.encode("utf-8")).hexdigest()[:12]
+    return cache_dir / f"processed_{dataset_tag}_{cache_key}.pt"
+
+
+def load_or_process_data(cfg, raw_data, dataset_tag='bidmc'):
+    cache_cfg = _cfg_get(cfg, "cache", {}) or {}
+    use_cache = cache_cfg.get("use_preprocessed", True)
+    cache_path = build_preprocess_cache_path(cfg, dataset_tag)
+
+    if use_cache and cache_path.exists():
+        logger.info(f"Loading preprocessed data from cache: {cache_path}")
+        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+        return cached["processed_data"]
+
+    logger.info(f"Preprocessing raw data for {dataset_tag} (cache miss or disabled).")
+    processed = process_data(cfg, raw_data, dataset_name=dataset_tag)
+
+    if use_cache:
+        torch.save({"processed_data": processed}, cache_path)
+        logger.info(f"Saved preprocessed cache to: {cache_path}")
+    return processed
+
+
+def maybe_save_preprocess_visuals(cfg, subject_id, ppg, ppg_denoised, ppg_filtered, ppg_cliped, freq_segments, breath_segments):
+    artifacts_cfg = _cfg_get(cfg, "artifacts", {}) or {}
+    if not artifacts_cfg.get("save_preprocess_visuals", True):
+        return
+
+    max_subjects = int(artifacts_cfg.get("max_subject_visuals", 10))
+    try:
+        if int(subject_id) > max_subjects:
+            return
+    except Exception:
+        pass
+
+    out_dir = get_artifact_root(cfg) / "preprocess" / str(subject_id)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    n = min(len(ppg), 125 * 15)
+    fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
+    axs[0].plot(ppg[:n]); axs[0].set_title("Raw PPG")
+    axs[1].plot(ppg_denoised[:n]); axs[1].set_title("Denoised PPG")
+    axs[2].plot(ppg_filtered[:n]); axs[2].set_title("Bandpass Filtered PPG")
+    axs[3].plot(ppg_cliped[:n]); axs[3].set_title("After Outlier Handling")
+    fig.tight_layout()
+    fig.savefig(out_dir / "pipeline_timeseries.png", dpi=150)
+    plt.close(fig)
+
+    if len(freq_segments) > 0:
+        fig2, axs2 = plt.subplots(2, 1, figsize=(12, 7))
+        axs2[0].plot(np.asarray(ppg_cliped)[:125 * 60])
+        axs2[0].set_title("Example Segment (60s)")
+        axs2[1].imshow(np.asarray(freq_segments[0]), aspect='auto', origin='lower', cmap='viridis')
+        axs2[1].set_title(f"Scalogram (target breath≈{float(np.asarray(breath_segments[0]).mean()):.2f})")
+        fig2.tight_layout()
+        fig2.savefig(out_dir / "segment_scalogram.png", dpi=150)
+        plt.close(fig2)
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -1865,6 +1949,9 @@ def process_data(cfg, raw_data, dataset_name='bidmc'):
         # )
 
         processed_data[subject_id] = (ppg_segments, rr_segments, freq_segments, ppg_segments_ssl, breath_segments)
+        maybe_save_preprocess_visuals(
+            cfg, subject_id, ppg, ppg_denoised, ppg_filtered, ppg_cliped, freq_segments, breath_segments
+        )
         # logger.info(f"processed data is {processed_data}")
         
         
@@ -3121,7 +3208,7 @@ def main(cfg: DictConfig):
     # exit()
     print(raw_data.keys())
     print(len(raw_data.keys()))
-    processed_data = process_data(cfg, raw_data)
+    processed_data = load_or_process_data(cfg, raw_data, dataset_tag="bidmc")
 
 
     print(f"processed data length: {len(processed_data)}")
@@ -3140,7 +3227,7 @@ def main(cfg: DictConfig):
         # Add capno subjects
         for subject, (ppg, breath) in raw_data_capnobase.items():
             combined[f"capno_{subject}"] = (ppg, rr_temp, breath)
-        processed_data_capnobase = process_data(cfg, combined)
+        processed_data_capnobase = load_or_process_data(cfg, combined, dataset_tag="capnobase")
 
     count_zero = 0
     segment_counts = {}

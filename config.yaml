@@ -63,3 +63,11 @@ ssl:
   max_epochs: 1
   use_capnobase: False
   use_bidmc: False
+cache:
+  use_preprocessed: True
+  dir: "data/preprocessed"
+
+artifacts:
+  output_dir: "artifacts"
+  save_preprocess_visuals: True
+  max_subject_visuals: 10
