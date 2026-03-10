@@ -1,0 +1,65 @@
+seed: 42
+data_dir: "data/preprocessed/"
+preprocessing:
+  bandpass_filter:
+    type: "butter"  # Type of bandpass filter: "butter", "cheby1", etc.
+    low_freq: 0.1  # Lower frequency for better stability
+    high_freq: 0.5   # Higher frequency, well below Nyquist
+    order: 8         # Lower order for better numerical stability
+  use_denoiser: False  # Whether to apply denoising
+  use_edpa: False
+  use_wavelet_denoising: False
+  remove_outliers: False  # Whether to remove outliers from the PPG signal
+  filter: True
+
+data:
+  path: "data/"
+
+training:
+  model_name: "Linear" # Model architecture to use options: ["LSTMRR", "RWKV", "RWKVTime", "RWKVTimeOPT"]
+  batch_size: 64 # Batch size for training
+  learning_rate: 1e-3 # Learning rate for the optimizer
+  optimizer: "adamw" # Optimizer type options: ["adam", "adamw", "sgd"]
+  weight_decay: 1e-4 # Weight decay for regularization
+  scheduler: "ReduceLROnPlateau" # Learning rate scheduler type options: ["StepLR", "ReduceLROnPlateau", "CosineAnnealingLR"]
+  max_epochs: 1000 # Maximum number of training epochs
+  num_workers: 8 # Number of workers for data loading
+  criterion: "L1Loss" # Loss function options: ["MSELoss", "L1Loss"]
+  checkpoint_dir: "checkpoints" # Directory to save model checkpoints
+  early_stopping_patience: 10 # Patience for early stopping
+  gradient_clip_val: 1.0 # Gradient clipping value
+  n_freq_bins: 8 # Number of frequency bins for frequency-domain features
+  pretrained_path: "pretrained_lstm_encoder.pth" # Path to save/load pretrained encoder weights
+  ablation_mode: fusion # Ablation mode options: ["fusion", "time_only", "freq_only"]
+  time_model_output_dim: 60
+  freq_model_output_dim: 60
+  use_ssl_pretraining: False  # Set to `true` to run SSL, `false` to train from scratch
+  time_model_num_layers: 2
+  dropout: 0.1
+  window_size: 60
+  overlap: 57
+  use_augmentation: False
+  noise_std: 0.05
+  off_aug_time: False
+  off_aug_freq: True
+  use_capno: False
+  hidden_size: 1024
+  num_layers: 2
+
+
+logging:
+  log_dir: "logs" # Directory for logging
+  experiment_name: "ourtest" # Name of the experiment for logging
+# Hardware Configuration
+hardware:
+  devices: 1
+  precision: 32
+
+mode:
+  optuna: False
+
+
+ssl:
+  max_epochs: 1
+  use_capnobase: False
+  use_bidmc: False
