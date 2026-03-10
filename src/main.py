@@ -161,6 +161,17 @@ def load_files_capnobase(path,subjects):
 def read_data(path):
     # Code to read data goes here
     raw_data = {}
+
+    # Support both:
+    # 1) path/data_root/bidmc
+    # 2) path/bidmc (directly pointing to bidmc folder)
+    if os.path.basename(os.path.normpath(path)).lower() == "bidmc":
+        subjects = load_subjects_bidmc(path)
+        if subjects:
+            raw_data = load_files_bidmc(path, subjects)
+            logger.info(f"Loaded BIDMC subjects: {len(subjects)} from direct path {path}")
+        return raw_data
+
     for dataset_name in os.listdir(path):
         dataset_path = os.path.join(path,dataset_name)
         if not os.path.isdir(dataset_path):
@@ -2807,12 +2818,12 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
         # logger.info(f"\nSTEP 2: Analyzing AUGMENTED data for Fold {fold_id}...")
         # analyze_fold_distribution_after_augmentation(fold_id, fold_data)
         if cfg.training.ablation_mode == 'freq_only':
-            train_dataset = PPGRRDataset(cfg,fold_data['train_freq'], fold_data['train_breath'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
+            train_dataset = PPGRRDataset(cfg, fold_data['train_freq'], fold_data['train_rr'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
         else:
-            train_dataset = PPGRRDataset(cfg,fold_data['train_ppg'], fold_data['train_breath'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
+            train_dataset = PPGRRDataset(cfg, fold_data['train_ppg'], fold_data['train_rr'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
 
-        val_dataset = PPGRRDataset(cfg,fold_data['val_freq'], fold_data['val_rr'], fold_data['val_freq'], fold_data['val_breath'], augment=False)
-        test_dataset = PPGRRDataset(cfg,fold_data['test_freq'], fold_data['test_rr'], fold_data['test_freq'], fold_data['test_breath'], augment=False)
+        val_dataset = PPGRRDataset(cfg, fold_data['val_ppg'], fold_data['val_rr'], fold_data['val_freq'], fold_data['val_breath'], augment=False)
+        test_dataset = PPGRRDataset(cfg, fold_data['test_ppg'], fold_data['test_rr'], fold_data['test_freq'], fold_data['test_breath'], augment=False)
 
         # fold_file = f"{cfg.data_dir}/fold_{cv_split['fold_id']}.pt"
         # if cfg.training.ablation_mode == 'freq_only':
@@ -3056,28 +3067,15 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
                              profiler=profiler,
                              benchmark=False
                              )
-        ckpt_dir = Path(f"logs/freqonly_v149/fold_{fold_id}/checkpoints")
+        model = RRLightningModule(cfg)
 
-        ckpt_files = list(ckpt_dir.glob(f"best-checkpoint-fold{fold_id}-*.ckpt"))
-
-        assert len(ckpt_files) == 1, f"Expected 1 best checkpoint, found {len(ckpt_files)}"
-
-        ckpt_path = ckpt_files[0]
-
-        model = RRLightningModule.load_from_checkpoint(
-            ckpt_path,
-            cfg=cfg
-        )
-        # model = RRLightningModule(cfg)
-        
-        # fine_tune_trainer.fit(model, data_module)
+        fine_tune_trainer.fit(model, data_module)
         # Write profiler summary to file
         # os.makedirs("profiles", exist_ok=True)
         # summary = profiler.summary()
         # with open("profiles/profiler_summary.txt", "w") as f:
         #     f.write(summary)
-        # test_reults = fine_tune_trainer.test(model, datamodule=data_module, ckpt_path="best")
-        test_reults = fine_tune_trainer.test(model, datamodule=data_module)
+        test_reults = fine_tune_trainer.test(datamodule=data_module, ckpt_path="best")
         all_fold_results.append({
             "fold_id": fold_id,
             "test_results": test_reults[0]
