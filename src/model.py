@@ -25,6 +25,7 @@ from rwkv_freq import RWKVScalogramModel
 # from rwkv_freq2 import RWKVScalogramModel
 from mamba import MambaScalogramModel
 import itertools
+from pathlib import Path
 
 def ppg_augmentation(x, crop_ratio=0.8):
     """
@@ -1191,11 +1192,8 @@ class RRLightningModule(pl.LightningModule):
             features.append(self.freq_model(freq))
 
         z = torch.cat(features, dim=1)  # (B, fusion_dim)
-        # # z = features[0]
-        
-        # out = self.head(z)  # (B,)
-        # return out
-        return z
+        out = self.head(z)  # (B, 1)
+        return out
         # return features
 
         # time_feat = self.time_model(ppg)    # (B,128)
@@ -1345,6 +1343,13 @@ class RRLightningModule(pl.LightningModule):
                         tensorboard.add_figure("Analysis/ErrorByBin", fig3, self.current_epoch)
                     except Exception as e:
                         print(f"Warning: Could not log figures to tensorboard: {e}")
+
+                if hasattr(self.logger, 'log_dir'):
+                    vis_dir = Path(self.logger.log_dir) / "figures" / "validation"
+                    vis_dir.mkdir(parents=True, exist_ok=True)
+                    fig1.savefig(vis_dir / f"epoch_{self.current_epoch:03d}_regression.png", dpi=150)
+                    fig2.savefig(vis_dir / f"epoch_{self.current_epoch:03d}_bland_altman.png", dpi=150)
+                    fig3.savefig(vis_dir / f"epoch_{self.current_epoch:03d}_error_by_bin.png", dpi=150)
                 
                 # CRITICAL: Close all figures to prevent memory leaks
                 plt.close(fig1)
@@ -1473,6 +1478,14 @@ class RRLightningModule(pl.LightningModule):
             tb.add_figure("Test/Regression", fig1, 0)
             tb.add_figure("Test/BlandAltman", fig2, 0)
             tb.add_figure("Test/ErrorByBin", fig3, 0)
+
+        if hasattr(self.logger, 'log_dir'):
+            test_vis_dir = Path(self.logger.log_dir) / "figures" / "test"
+            test_vis_dir.mkdir(parents=True, exist_ok=True)
+            fig1.savefig(test_vis_dir / "regression.png", dpi=150)
+            fig2.savefig(test_vis_dir / "bland_altman.png", dpi=150)
+            fig3.savefig(test_vis_dir / "error_by_bin.png", dpi=150)
+            np.savez(test_vis_dir / "predictions_targets.npz", preds=preds, targets=targets)
 
         plt.close('all')
     # def on_test_epoch_end(self):

@@ -237,10 +237,10 @@ class PPGRRDataModule(LightningDataModule):
         # return torch.utils.data.DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, persistent_workers=True)
 
     def val_dataloader(self):
-        return torch.utils.data.DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, persistent_workers=True, worker_init_fn=worker_init_fn)
+        return torch.utils.data.DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, persistent_workers=(self.num_workers > 0), worker_init_fn=worker_init_fn)
 
     def test_dataloader(self):
-        return torch.utils.data.DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, persistent_workers=True, worker_init_fn=worker_init_fn)
+        return torch.utils.data.DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, persistent_workers=(self.num_workers > 0), worker_init_fn=worker_init_fn)
     
 class FullSSLDataModule(LightningDataModule):
     def __init__(self, train_set, val_set, batch_size, num_workers):
