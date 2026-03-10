@@ -27,7 +27,6 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 import optuna
 from my_optuna import objective
 import json
-from pytorch_lightning.strategies import DDPStrategy
 from skimage.transform import resize
 import torch.distributed as dist
 from sklearn.model_selection import KFold, train_test_split
@@ -53,6 +52,15 @@ from model import SSLModel, SSLJigsawModel
 from dataset import PPGRRDatasetFromDisk
 from pathlib import Path
 logger = logging.getLogger("ReadData")
+
+
+def resolve_trainer_strategy(devices):
+    """Use DDP only when running on multiple devices."""
+    if isinstance(devices, int):
+        return "ddp_find_unused_parameters_true" if devices > 1 else "auto"
+    if isinstance(devices, (list, tuple)):
+        return "ddp_find_unused_parameters_true" if len(devices) > 1 else "auto"
+    return "auto"
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -2935,7 +2943,7 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
             ssl_trainer = pl.Trainer(
                 max_epochs=cfg.ssl.max_epochs,
                 accelerator="auto",
-                strategy='ddp_find_unused_parameters_true',
+                strategy=resolve_trainer_strategy(cfg.hardware.devices),
                 devices=cfg.hardware.devices,
                 logger=ssl_logger,
                 callbacks=[ssl_checkpoint_callback, TQDMProgressBar(leave=True)],
@@ -3052,11 +3060,10 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
         
 
         profiler = SimpleProfiler(dirpath=f"profiles/fold_{fold_id}", filename="profiler_summary.txt")  # Saves to file
-        ddp_strategy = DDPStrategy(find_unused_parameters=False)
         fine_tune_trainer = pl.Trainer(max_epochs=cfg.training.max_epochs,
                              accelerator="auto",
                              devices=cfg.hardware.devices,
-                             strategy='ddp_find_unused_parameters_true',
+                             strategy=resolve_trainer_strategy(cfg.hardware.devices),
                             #  detect_anomaly=True,
                              callbacks=callbacks,
                              logger=tblogger,
