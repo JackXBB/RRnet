@@ -1304,9 +1304,9 @@ class RRLightningModule(pl.LightningModule):
                 fig1, ax1 = plt.subplots(figsize=(6, 6))
                 ax1.scatter(targets_np, preds_np, alpha=0.3)
                 ax1.plot([targets_np.min(), targets_np.max()], [targets_np.min(), targets_np.max()], 'r--')
-                ax1.set_xlabel("True RR")
-                ax1.set_ylabel("Predicted RR")
-                ax1.set_title(f"Epoch {self.current_epoch}: Regression Plot")
+                ax1.set_xlabel("真实呼吸率 RR")
+                ax1.set_ylabel("预测呼吸率 RR")
+                ax1.set_title(f"第 {self.current_epoch} 轮：回归散点图")
                 
                 # --- ANALYSIS 2: Bland-Altman Plot ---
                 fig2, ax2 = plt.subplots(figsize=(8, 4))
@@ -1316,12 +1316,12 @@ class RRLightningModule(pl.LightningModule):
                 std_diff = np.std(diffs)
                 
                 ax2.scatter(means, diffs, alpha=0.3)
-                ax2.axhline(mean_diff, color='red', linestyle='--', label=f'Mean Bias: {mean_diff:.2f}')
+                ax2.axhline(mean_diff, color='red', linestyle='--', label=f'平均偏差: {mean_diff:.2f}')
                 ax2.axhline(mean_diff + 1.96*std_diff, color='gray', linestyle='--')
                 ax2.axhline(mean_diff - 1.96*std_diff, color='gray', linestyle='--')
-                ax2.set_xlabel("Mean of (Pred + True)")
-                ax2.set_ylabel("Difference (Pred - True)")
-                ax2.set_title("Bland-Altman Plot")
+                ax2.set_xlabel("均值（预测 + 真实）")
+                ax2.set_ylabel("差值（预测 - 真实）")
+                ax2.set_title("Bland-Altman 图")
                 ax2.legend()
 
                 # --- ANALYSIS 3: Error by Rate Bin ---
@@ -1332,7 +1332,7 @@ class RRLightningModule(pl.LightningModule):
                 
                 fig3, ax3 = plt.subplots(figsize=(8, 4))
                 sns.barplot(data=df, x='binned', y='abs_error', ax=ax3)
-                ax3.set_title("MAE by Respiratory Rate Zone")
+                ax3.set_title("不同呼吸频率区间的 MAE")
                 
                 # --- LOGGING ---
                 if hasattr(self.logger, 'experiment'):
@@ -1435,9 +1435,9 @@ class RRLightningModule(pl.LightningModule):
         ax1.scatter(targets, preds, alpha=0.3)
         lims = [min(targets.min(), preds.min()), max(targets.max(), preds.max())]
         ax1.plot(lims, lims, 'r--')
-        ax1.set_xlabel("True RR (bpm)")
-        ax1.set_ylabel("Predicted RR (bpm)")
-        ax1.set_title("Test Set: Predicted vs True RR")
+        ax1.set_xlabel("真实呼吸率 RR（bpm）")
+        ax1.set_ylabel("预测呼吸率 RR（bpm）")
+        ax1.set_title("测试集：预测值与真实值对比")
 
         # --- 2. Bland–Altman Plot ---
         means = (targets + preds) / 2
@@ -1448,12 +1448,12 @@ class RRLightningModule(pl.LightningModule):
         fig2, ax2 = plt.subplots(figsize=(8, 4))
         ax2.scatter(means, diffs, alpha=0.3)
         ax2.axhline(mean_diff, color='red', linestyle='--',
-                    label=f'Mean Bias = {mean_diff:.2f}')
+                    label=f'平均偏差 = {mean_diff:.2f}')
         ax2.axhline(mean_diff + 1.96*std_diff, color='gray', linestyle='--')
         ax2.axhline(mean_diff - 1.96*std_diff, color='gray', linestyle='--')
-        ax2.set_xlabel("Mean RR (Pred, True)")
-        ax2.set_ylabel("Difference (Pred − True)")
-        ax2.set_title("Test Set: Bland–Altman Plot")
+        ax2.set_xlabel("呼吸率均值（预测与真实）")
+        ax2.set_ylabel("差值（预测−真实）")
+        ax2.set_title("测试集：Bland–Altman 图")
         ax2.legend()
 
         # --- 3. Error by RR Bin ---
@@ -1463,14 +1463,14 @@ class RRLightningModule(pl.LightningModule):
         })
 
         bins = [0, 10, 15, 20, 25, 100]
-        labels = ['<10', '10–15', '15–20', '20–25', '>25']
+        labels = ['<10', '10-15', '15-20', '20-25', '>25']
         df['RR_bin'] = pd.cut(df['RR'], bins=bins, labels=labels)
 
         fig3, ax3 = plt.subplots(figsize=(8, 4))
         sns.barplot(data=df, x='RR_bin', y='AbsError', ax=ax3)
-        ax3.set_xlabel("Respiratory Rate Range (bpm)")
-        ax3.set_ylabel("MAE (bpm)")
-        ax3.set_title("Test Set: MAE by RR Range")
+        ax3.set_xlabel("呼吸率区间（bpm）")
+        ax3.set_ylabel("MAE（bpm）")
+        ax3.set_title("测试集：不同呼吸率区间的 MAE")
 
         # --- Logging ---
         if hasattr(self.logger, "experiment"):

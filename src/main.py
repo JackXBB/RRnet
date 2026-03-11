@@ -16,6 +16,7 @@ from model import RRLightningModule, SSLPretrainModule
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.loggers import CSVLogger
 import time
 from pytorch_lightning.profilers import SimpleProfiler
 from tqdm import tqdm
@@ -128,10 +129,11 @@ def maybe_save_preprocess_visuals(cfg, subject_id, ppg, ppg_denoised, ppg_filter
 
     n = min(len(ppg), 125 * 15)
     fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-    axs[0].plot(ppg[:n]); axs[0].set_title("Raw PPG")
-    axs[1].plot(ppg_denoised[:n]); axs[1].set_title("Denoised PPG")
-    axs[2].plot(ppg_filtered[:n]); axs[2].set_title("Bandpass Filtered PPG")
-    axs[3].plot(ppg_cliped[:n]); axs[3].set_title("After Outlier Handling")
+    axs[0].plot(ppg[:n]); axs[0].set_title("原始 PPG 信号")
+    axs[1].plot(ppg_denoised[:n]); axs[1].set_title("去噪后 PPG 信号")
+    axs[2].plot(ppg_filtered[:n]); axs[2].set_title("带通滤波后 PPG 信号")
+    axs[3].plot(ppg_cliped[:n]); axs[3].set_title("异常值处理后 PPG 信号")
+    axs[3].set_xlabel("采样点")
     fig.tight_layout()
     fig.savefig(out_dir / "pipeline_timeseries.png", dpi=150)
     plt.close(fig)
@@ -139,12 +141,66 @@ def maybe_save_preprocess_visuals(cfg, subject_id, ppg, ppg_denoised, ppg_filter
     if len(freq_segments) > 0:
         fig2, axs2 = plt.subplots(2, 1, figsize=(12, 7))
         axs2[0].plot(np.asarray(ppg_cliped)[:125 * 60])
-        axs2[0].set_title("Example Segment (60s)")
+        axs2[0].set_title("示例片段（60秒）")
         axs2[1].imshow(np.asarray(freq_segments[0]), aspect='auto', origin='lower', cmap='viridis')
-        axs2[1].set_title(f"Scalogram (target breath≈{float(np.asarray(breath_segments[0]).mean()):.2f})")
+        axs2[1].set_title(f"时频图（目标呼吸值≈{float(np.asarray(breath_segments[0]).mean()):.2f}）")
+        axs2[1].set_xlabel("时间步")
+        axs2[1].set_ylabel("频率通道")
         fig2.tight_layout()
         fig2.savefig(out_dir / "segment_scalogram.png", dpi=150)
         plt.close(fig2)
+
+
+def save_training_curves_from_csv(csv_log_dir, output_dir):
+    metrics_file = Path(csv_log_dir) / "metrics.csv"
+    if not metrics_file.exists():
+        logger.warning(f"未找到训练指标文件: {metrics_file}")
+        return
+
+    df = pd.read_csv(metrics_file)
+    if df.empty:
+        logger.warning(f"训练指标为空，跳过绘图: {metrics_file}")
+        return
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    epoch_df = df.dropna(subset=["epoch"]).copy()
+    if epoch_df.empty:
+        logger.warning(f"日志中没有按 epoch 汇总的指标，跳过绘图: {metrics_file}")
+        return
+
+    epoch_df["epoch"] = epoch_df["epoch"].astype(int)
+    grouped = epoch_df.groupby("epoch", as_index=False).last()
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+
+    if "train_loss_epoch" in grouped.columns:
+        axes[0].plot(grouped["epoch"], grouped["train_loss_epoch"], label="训练损失", marker="o")
+    if "val_loss_epoch" in grouped.columns:
+        axes[0].plot(grouped["epoch"], grouped["val_loss_epoch"], label="验证损失", marker="s")
+    axes[0].set_title("训练与验证损失曲线")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    metric_name = None
+    if "val/MAE" in grouped.columns:
+        metric_name = "val/MAE"
+    elif "val_MAE" in grouped.columns:
+        metric_name = "val_MAE"
+    if metric_name:
+        axes[1].plot(grouped["epoch"], grouped[metric_name], label="验证 MAE", color="#d62728", marker="o")
+        axes[1].set_ylabel("MAE")
+    axes[1].set_title("验证集 MAE 变化")
+    axes[1].set_xlabel("Epoch")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "训练曲线.png", dpi=180)
+    plt.close(fig)
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -3143,6 +3199,11 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
             name=cfg.logging.experiment_name,
             version=f'fold_{cv_split["fold_id"]}'
         )
+        csv_logger = CSVLogger(
+            save_dir=cfg.logging.log_dir,
+            name=cfg.logging.experiment_name,
+            version=f'fold_{cv_split["fold_id"]}_csv'
+        )
         callbacks = setup_callbacks(cfg, fold_id, tblogger)
         
 
@@ -3153,7 +3214,7 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
                              strategy=resolve_trainer_strategy(cfg.hardware.devices),
                             #  detect_anomaly=True,
                              callbacks=callbacks,
-                             logger=tblogger,
+                             logger=[tblogger, csv_logger],
                              enable_progress_bar=True,
                              log_every_n_steps=1,
                              gradient_clip_val=cfg.training.gradient_clip_val,
@@ -3170,6 +3231,9 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
         # with open("profiles/profiler_summary.txt", "w") as f:
         #     f.write(summary)
         test_reults = fine_tune_trainer.test(datamodule=data_module, ckpt_path="best")
+
+        artifact_curve_dir = get_artifact_root(cfg) / "training" / f"fold_{fold_id}"
+        save_training_curves_from_csv(csv_logger.log_dir, artifact_curve_dir)
         all_fold_results.append({
             "fold_id": fold_id,
             "test_results": test_reults[0]
