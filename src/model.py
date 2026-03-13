@@ -1430,14 +1430,42 @@ class RRLightningModule(pl.LightningModule):
         errors = preds - targets
         abs_errors = np.abs(errors)
 
-        # --- 1. Regression Plot ---
-        fig1, ax1 = plt.subplots(figsize=(6, 6))
-        ax1.scatter(targets, preds, alpha=0.3)
-        lims = [min(targets.min(), preds.min()), max(targets.max(), preds.max())]
-        ax1.plot(lims, lims, 'r--')
-        ax1.set_xlabel("真实呼吸率 RR（bpm）")
-        ax1.set_ylabel("预测呼吸率 RR（bpm）")
+        # --- 1. Enhanced Regression Plot (style similar to requested figure) ---
+        fig1, ax1 = plt.subplots(figsize=(8.2, 6.2))
+        fig1.patch.set_facecolor('#f2f2f2')
+        ax1.set_facecolor('#f2f2f2')
+
+        # Group by rounded target RR so each vertical column has a mean marker.
+        target_groups = np.round(targets, 1)
+        unique_x = np.unique(target_groups)
+        mean_pred_by_x = {x: preds[target_groups == x].mean() for x in unique_x}
+
+        # Scatter all predictions.
+        ax1.scatter(targets, preds, s=28, alpha=0.85, color='#1f77b4', edgecolors='none', label='预测值')
+
+        # Draw dashed vertical lines from each point to the group's mean prediction.
+        for x, y in zip(target_groups, preds):
+            mean_y = mean_pred_by_x[x]
+            ax1.plot([x, x], [mean_y, y], linestyle='--', linewidth=0.9, color='blue', alpha=0.75)
+
+        # Plot group means as red triangles.
+        mean_x = np.array(sorted(mean_pred_by_x.keys()))
+        mean_y = np.array([mean_pred_by_x[x] for x in mean_x])
+        ax1.scatter(mean_x, mean_y, s=42, color='red', marker='^', edgecolors='white', linewidths=0.5, label='预测均值', zorder=4)
+
+        lim_low = min(targets.min(), preds.min())
+        lim_high = max(targets.max(), preds.max())
+        padding = max((lim_high - lim_low) * 0.05, 0.5)
+        lims = [lim_low - padding, lim_high + padding]
+        ax1.plot(lims, lims, 'r--', linewidth=1.4, label='y = x')
+
+        ax1.set_xlim(lims)
+        ax1.set_ylim(lims)
+        ax1.set_xlabel("真实呼吸率 RR (bpm)")
+        ax1.set_ylabel("预测呼吸率 RR (bpm)")
         ax1.set_title("测试集：预测值与真实值对比")
+        ax1.legend(loc='upper left', framealpha=0.95)
+        ax1.grid(alpha=0.25)
 
         # --- 2. Bland–Altman Plot ---
         means = (targets + preds) / 2
