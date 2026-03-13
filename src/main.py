@@ -31,7 +31,7 @@ import json
 import hashlib
 from skimage.transform import resize
 import torch.distributed as dist
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import KFold
 import random
 from skimage.transform import resize
 from model import FreqSSLPretrainModule
@@ -201,6 +201,96 @@ def save_training_curves_from_csv(csv_log_dir, output_dir):
     fig.tight_layout()
     fig.savefig(output_dir / "训练曲线.png", dpi=180)
     plt.close(fig)
+
+def summarize_fold_results(all_fold_results):
+    rows = []
+    for fold_result in all_fold_results:
+        metrics = fold_result["test_results"]
+        rows.append({
+            "fold_id": fold_result["fold_id"],
+            "test/MAE": float(metrics.get("test/MAE", np.nan)),
+            "test/PCC": float(metrics.get("test/PCC", np.nan)),
+            "test/MSE": float(metrics.get("test/MSE", np.nan)),
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df, {}
+
+    summary = {
+        "mae_mean": float(df["test/MAE"].mean()),
+        "mae_std": float(df["test/MAE"].std(ddof=0)),
+        "pcc_mean": float(df["test/PCC"].mean()),
+        "pcc_std": float(df["test/PCC"].std(ddof=0)),
+        "mse_mean": float(df["test/MSE"].mean()),
+        "mse_std": float(df["test/MSE"].std(ddof=0)),
+    }
+    return df, summary
+
+
+def save_cv_summary_and_plot(all_fold_results, output_dir, run_name):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_df, summary = summarize_fold_results(all_fold_results)
+    if fold_df.empty:
+        logger.warning(f"{run_name}: no fold results to summarize.")
+        return
+
+    fold_df.to_csv(output_dir / f"{run_name}_fold_metrics.csv", index=False)
+    pd.DataFrame([{"run": run_name, **summary}]).to_csv(output_dir / f"{run_name}_summary.csv", index=False)
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    x = fold_df["fold_id"].to_numpy()
+    ax1.plot(x, fold_df["test/MAE"], marker="o", label="MAE", color="#1f77b4")
+    ax1.set_xlabel("Fold")
+    ax1.set_ylabel("MAE", color="#1f77b4")
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+    ax1.grid(alpha=0.3)
+
+    ax2 = ax1.twinx()
+    ax2.plot(x, fold_df["test/PCC"], marker="s", label="PCC", color="#d62728")
+    ax2.set_ylabel("PCC", color="#d62728")
+    ax2.tick_params(axis="y", labelcolor="#d62728")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
+    ax1.set_title(f"{run_name}: 5折测试指标")
+
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{run_name}_cv_metrics.png", dpi=180)
+    plt.close(fig)
+
+
+def run_training_and_report(cfg, run_label, processed_data, processed_capnobase_ssl, processed_data_capnobase):
+    cv_splits = create_folds(processed_data, n_splits=5, seed=cfg.seed)
+    logger.info(f"[{run_label}] Created folds: {cv_splits}")
+
+    all_test_subjects = set()
+    for fold in cv_splits:
+        all_test_subjects.update(fold["test_subjects"])
+
+    all_subjects = set(processed_data.keys())
+    missing_subjects = all_subjects - all_test_subjects
+    extra_subjects = all_test_subjects - all_subjects
+
+    print(f"[{run_label}] ✅ Total subjects: {len(all_subjects)}")
+    print(f"[{run_label}] ✅ Subjects covered in test sets: {len(all_test_subjects)}")
+    print(f"[{run_label}] 🧩 Missing subjects in test folds: {missing_subjects if missing_subjects else 'None'}")
+    print(f"[{run_label}] ⚠️ Unexpected subjects: {extra_subjects if extra_subjects else 'None'}")
+
+    all_fold_results = train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_data_capnobase)
+
+    artifact_dir = get_artifact_root(cfg) / "training" / run_label
+    save_cv_summary_and_plot(all_fold_results, artifact_dir, run_name=run_label)
+
+    _, summary = summarize_fold_results(all_fold_results)
+    print(f"[{run_label}] Average MAE across folds: {summary.get('mae_mean', float('nan')):.4f} ± {summary.get('mae_std', float('nan')):.4f}")
+    print(f"[{run_label}] Average PCC across folds: {summary.get('pcc_mean', float('nan')):.4f} ± {summary.get('pcc_std', float('nan')):.4f}")
+
+    return all_fold_results, summary
+
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -2138,39 +2228,54 @@ def create_balanced_folds(processed_data, n_splits=5):
     return cv_splits
 
 
-def create_folds(processed_data, n_splits=10, seed=42):
-
-    # Fix random seeds for reproducibility
+def create_folds(processed_data, n_splits=5, seed=42):
+    """
+    Subject-level k-fold CV:
+    - each subject appears in test set exactly once
+    - validation set is split from training subjects only
+    """
     np.random.seed(seed)
     random.seed(seed)
-    all_subjects = set(processed_data.keys())
-    subjects_array = np.array(sorted(all_subjects))
-    # print(f"in create_folds: {all_subjects}")
-    # Shuffle subjects
-    shuffled_indices = np.random.permutation(len(list(all_subjects)))
-    shuffled_subjects = subjects_array[shuffled_indices]
-    
-    trainval_subjects, test_subjects = train_test_split(
-        shuffled_subjects,
-        test_size=0.10
 
-    )
-    # Create k-fold splits
-    kfold = KFold(n_splits=n_splits, shuffle=False, random_state=None)  # Already shuffled
+    all_subjects = sorted(processed_data.keys())
+    subjects_array = np.array(all_subjects)
+    num_subjects = len(subjects_array)
+
+    if num_subjects == 0:
+        raise ValueError(
+            "No processed subjects found. Please verify dataset files under cfg.data.path "
+            "(expected BIDMC folders/files) and check preprocessing cache configuration."
+        )
+
+    if num_subjects < 3:
+        raise ValueError(
+            f"At least 3 subjects are required to build train/val/test splits, got {num_subjects}."
+        )
+
+    effective_splits = min(n_splits, num_subjects)
+    if effective_splits != n_splits:
+        logger.warning(
+            f"Requested n_splits={n_splits}, but only {num_subjects} subjects are available. "
+            f"Using n_splits={effective_splits}."
+        )
+
+    kfold = KFold(n_splits=effective_splits, shuffle=True, random_state=seed)
     cv_splits = []
-    # for fold_id, (train_val_indices, test_indices) in enumerate(kfold.split(shuffled_subjects)):
-    #     train_val_subjects = shuffled_subjects[train_val_indices].tolist()
-    #     test_subjects = shuffled_subjects[test_indices].tolist()
-    for fold_id, (train_indices, val_indices) in enumerate(kfold.split(trainval_subjects)):
-        train_subjects = trainval_subjects[train_indices].tolist()
-        val_subjects = trainval_subjects[val_indices].tolist()
-        
-        # n_val_subjects = max(1, int(len(train_val_subjects) * 0.2))
-        # # n_val_subjects = len(test_subjects)
-        # random.seed(seed + fold_id)  # make per-fold val split deterministic
-        # val_subjects = random.sample(train_val_subjects, n_val_subjects)
-        # train_subjects = [s for s in train_val_subjects if s not in val_subjects]
-        
+
+    for fold_id, (train_val_indices, test_indices) in enumerate(kfold.split(subjects_array), start=1):
+        train_val_subjects = subjects_array[train_val_indices].tolist()
+        test_subjects = subjects_array[test_indices].tolist()
+
+        if len(train_val_subjects) < 2:
+            raise ValueError("Not enough subjects in train_val split to build validation set.")
+
+        val_size = max(1, int(round(len(train_val_subjects) * 0.2)))
+        val_size = min(val_size, len(train_val_subjects) - 1)
+
+        fold_rng = random.Random(seed + fold_id)
+        val_subjects = fold_rng.sample(train_val_subjects, val_size)
+        val_subject_set = set(val_subjects)
+        train_subjects = [s for s in train_val_subjects if s not in val_subject_set]
 
         test_set = set(test_subjects)
         val_set = set(val_subjects)
@@ -2180,25 +2285,25 @@ def create_folds(processed_data, n_splits=10, seed=42):
         overlap_test_train = test_set & train_set
         overlap_val_train = val_set & train_set
 
-        logger.info(f"Fold {fold_id+1} overlap between test and val: {overlap_test_val}")
-        logger.info(f"Fold {fold_id+1} overlap between test and train: {overlap_test_train}")
-        logger.info(f"Fold {fold_id+1} overlap between validation and train: {overlap_val_train}")
+        logger.info(f"Fold {fold_id} overlap between test and val: {overlap_test_val}")
+        logger.info(f"Fold {fold_id} overlap between test and train: {overlap_test_train}")
+        logger.info(f"Fold {fold_id} overlap between validation and train: {overlap_val_train}")
 
         union = train_set | val_set | test_set
-        coverage = union == all_subjects
-        missing_subjects = all_subjects - union if not coverage else set()
+        coverage = union == set(all_subjects)
+        missing_subjects = set(all_subjects) - union if not coverage else set()
 
-        logger.info(f"Fold {fold_id+1} covers all subjects: {coverage}")
-        logger.info(f"Fold {fold_id+1} missing subjects: {missing_subjects}")
+        logger.info(f"Fold {fold_id} covers all subjects: {coverage}")
+        logger.info(f"Fold {fold_id} missing subjects: {missing_subjects}")
 
         cv_splits.append({
             "train_subjects": train_subjects,
             "val_subjects": val_subjects,
             "test_subjects": test_subjects,
-            "fold_id": fold_id+1
+            "fold_id": fold_id,
         })
-    return cv_splits
 
+    return cv_splits
 def create_data_splits(cfg, cv_split, processed_data, processed_data_capnobase):
 
     train_subjects = cv_split["train_subjects"]
@@ -3277,6 +3382,12 @@ def main(cfg: DictConfig):
 
     print(f"processed data length: {len(processed_data)}")
     print(f"processed data for subjects")
+
+    if len(processed_data) == 0:
+        logger.error("未读取到任何可训练受试者，请检查 data.path、原始数据目录结构以及缓存文件。")
+        logger.error(f"当前 data.path: {cfg.data.path}")
+        logger.error("可先确认 data 目录下是否存在 BIDMC 数据，再运行：python src/main.py ...")
+        return
     
     processed_data_capnobase = None
     if cfg.training.use_capno:
@@ -3441,42 +3552,66 @@ def main(cfg: DictConfig):
         logger.info("Skipping CapnoBase dataset loading as per config.")
 
 
-    # cv_splits = create_balanced_folds(processed_data, n_splits=5)
-    cv_splits = create_folds(processed_data, n_splits=5)
-    logger.info(f"Created folds: {cv_splits}")
+    baseline_models = _cfg_get(cfg.training, "baseline_models", []) or []
 
+    print("\n========== 主模型训练（5折交叉验证）==========")
+    _, main_summary = run_training_and_report(
+        cfg,
+        run_label=f"main_{cfg.training.model_name}",
+        processed_data=processed_data,
+        processed_capnobase_ssl=processed_capnobase_ssl,
+        processed_data_capnobase=processed_data_capnobase,
+    )
 
-    # Collect all test subjects across folds
-    all_test_subjects = set()
-    for fold in cv_splits:
-        all_test_subjects.update(fold["test_subjects"])
+    comparison_rows = [{
+        "run": f"main_{cfg.training.model_name}",
+        "model_name": cfg.training.model_name,
+        **main_summary,
+    }]
 
-    # Collect all subjects in the dataset
-    all_subjects = set(processed_data.keys())
+    original_model_name = cfg.training.model_name
+    original_use_ssl = cfg.training.use_ssl_pretraining
 
-    # Check coverage
-    missing_subjects = all_subjects - all_test_subjects
-    extra_subjects = all_test_subjects - all_subjects
+    for baseline_model in baseline_models:
+        print(f"\n========== 基线模型训练（{baseline_model}）==========")
+        cfg.training.model_name = baseline_model
+        cfg.training.use_ssl_pretraining = False
 
-    print(f"✅ Total subjects: {len(all_subjects)}")
-    print(f"✅ Subjects covered in test sets: {len(all_test_subjects)}")
-    print(f"🧩 Missing subjects in test folds: {missing_subjects if missing_subjects else 'None'}")
-    print(f"⚠️ Unexpected subjects: {extra_subjects if extra_subjects else 'None'}")
-    # processed_data = None
-    all_fold_results = train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_data_capnobase)
-    
-    for fold_result in all_fold_results:
-        logger.info(f"Fold {fold_result['fold_id']} test results: {fold_result['test_results']}")
+        _, baseline_summary = run_training_and_report(
+            cfg,
+            run_label=f"baseline_{baseline_model}",
+            processed_data=processed_data,
+            processed_capnobase_ssl=None,
+            processed_data_capnobase=processed_data_capnobase,
+        )
 
-    # Summarize all fold results
+        comparison_rows.append({
+            "run": f"baseline_{baseline_model}",
+            "model_name": baseline_model,
+            **baseline_summary,
+        })
 
-    print(f"\nTraining completed!")
-    print(f"all fold results: {all_fold_results}")
-    all_maes = [fold_result['test_results']['test/MAE'] for fold_result in all_fold_results]
-    all_pcc = [fold_result['test_results']['test/PCC'] for fold_result in all_fold_results]
-    print(f"Average MAE across folds: {np.mean(all_maes):.4f} ± {np.std(all_maes):.4f}")
-    print(f"Average PCC across folds: {np.mean(all_pcc):.4f} ± {np.std(all_pcc):.4f}")
-    print("Hello, World!")
+    cfg.training.model_name = original_model_name
+    cfg.training.use_ssl_pretraining = original_use_ssl
+
+    comparison_df = pd.DataFrame(comparison_rows)
+    compare_dir = get_artifact_root(cfg) / "training" / "comparisons"
+    compare_dir.mkdir(parents=True, exist_ok=True)
+    comparison_df.to_csv(compare_dir / "model_comparison.csv", index=False)
+
+    if not comparison_df.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.bar(comparison_df["run"], comparison_df["mae_mean"], yerr=comparison_df["mae_std"], capsize=5, color="#4c72b0")
+        ax.set_ylabel("MAE (mean ± std)")
+        ax.set_title("主模型与基线模型 5 折结果对比")
+        ax.grid(axis="y", alpha=0.3)
+        plt.xticks(rotation=20, ha="right")
+        fig.tight_layout()
+        fig.savefig(compare_dir / "model_comparison_mae.png", dpi=180)
+        plt.close(fig)
+
+    print("\nTraining completed!")
+    print(comparison_df)
 
 
 if __name__ == "__main__":
