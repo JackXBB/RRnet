@@ -2239,6 +2239,27 @@ def create_folds(processed_data, n_splits=5, seed=42):
 
     all_subjects = sorted(processed_data.keys())
     subjects_array = np.array(all_subjects)
+    num_subjects = len(subjects_array)
+
+    if num_subjects == 0:
+        raise ValueError(
+            "No processed subjects found. Please verify dataset files under cfg.data.path "
+            "(expected BIDMC folders/files) and check preprocessing cache configuration."
+        )
+
+    if num_subjects < 3:
+        raise ValueError(
+            f"At least 3 subjects are required to build train/val/test splits, got {num_subjects}."
+        )
+
+    effective_splits = min(n_splits, num_subjects)
+    if effective_splits != n_splits:
+        logger.warning(
+            f"Requested n_splits={n_splits}, but only {num_subjects} subjects are available. "
+            f"Using n_splits={effective_splits}."
+        )
+
+    kfold = KFold(n_splits=effective_splits, shuffle=True, random_state=seed)
     if len(subjects_array) < n_splits:
         raise ValueError(f"Number of subjects ({len(subjects_array)}) must be >= n_splits ({n_splits}).")
 
@@ -3365,6 +3386,12 @@ def main(cfg: DictConfig):
 
     print(f"processed data length: {len(processed_data)}")
     print(f"processed data for subjects")
+
+    if len(processed_data) == 0:
+        logger.error("未读取到任何可训练受试者，请检查 data.path、原始数据目录结构以及缓存文件。")
+        logger.error(f"当前 data.path: {cfg.data.path}")
+        logger.error("可先确认 data 目录下是否存在 BIDMC 数据，再运行：python src/main.py ...")
+        return
     
     processed_data_capnobase = None
     if cfg.training.use_capno:
