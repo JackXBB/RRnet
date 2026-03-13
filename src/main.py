@@ -2260,6 +2260,10 @@ def create_folds(processed_data, n_splits=5, seed=42):
         )
 
     kfold = KFold(n_splits=effective_splits, shuffle=True, random_state=seed)
+    if len(subjects_array) < n_splits:
+        raise ValueError(f"Number of subjects ({len(subjects_array)}) must be >= n_splits ({n_splits}).")
+
+    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
     cv_splits = []
 
     for fold_id, (train_val_indices, test_indices) in enumerate(kfold.split(subjects_array), start=1):
