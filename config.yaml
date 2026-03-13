@@ -17,6 +17,7 @@ data:
 
 training:
   model_name: "Linear" # Model architecture to use options: ["LSTMRR", "RWKV", "RWKVTime", "RWKVTimeOPT"]
+  baseline_models: ["LSTMRR"] # Baseline models trained with the same 5-fold protocol for comparison
   batch_size: 64 # Batch size for training
   learning_rate: 1e-3 # Learning rate for the optimizer
   optimizer: "adamw" # Optimizer type options: ["adam", "adamw", "sgd"]
