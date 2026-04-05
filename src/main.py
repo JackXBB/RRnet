@@ -4,7 +4,7 @@ import scipy
 import pandas as pd
 import numpy as np
 import hydra
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from scipy import signal
 import logging
 import matplotlib.pyplot as plt
@@ -16,7 +16,6 @@ from model import RRLightningModule, SSLPretrainModule
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.loggers import CSVLogger
 import time
 from pytorch_lightning.profilers import SimpleProfiler
 from tqdm import tqdm
@@ -28,10 +27,10 @@ from pytorch_lightning.callbacks.progress import TQDMProgressBar
 import optuna
 from my_optuna import objective
 import json
-import hashlib
+from pytorch_lightning.strategies import DDPStrategy
 from skimage.transform import resize
 import torch.distributed as dist
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, train_test_split
 import random
 from skimage.transform import resize
 from model import FreqSSLPretrainModule
@@ -54,243 +53,6 @@ from model import SSLModel, SSLJigsawModel
 from dataset import PPGRRDatasetFromDisk
 from pathlib import Path
 logger = logging.getLogger("ReadData")
-
-
-def resolve_trainer_strategy(devices):
-    """Use DDP only when running on multiple devices."""
-    if isinstance(devices, int):
-        return "ddp_find_unused_parameters_true" if devices > 1 else "auto"
-    if isinstance(devices, (list, tuple)):
-        return "ddp_find_unused_parameters_true" if len(devices) > 1 else "auto"
-    return "auto"
-
-
-
-def _cfg_get(cfg, key, default=None):
-    return cfg.get(key, default) if hasattr(cfg, "get") else default
-
-
-def get_artifact_root(cfg):
-    artifacts_cfg = _cfg_get(cfg, "artifacts", {}) or {}
-    return Path(artifacts_cfg.get("output_dir", "artifacts"))
-
-
-def build_preprocess_cache_path(cfg, dataset_tag):
-    cache_cfg = _cfg_get(cfg, "cache", {}) or {}
-    cache_dir = Path(cache_cfg.get("dir", cfg.data_dir))
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    signature_payload = {
-        "dataset_tag": dataset_tag,
-        "data_path": cfg.data.path,
-        "preprocessing": OmegaConf.to_container(cfg.preprocessing, resolve=True),
-        "window_size": cfg.training.window_size,
-        "overlap": cfg.training.overlap,
-        "n_freq_bins": cfg.training.n_freq_bins,
-    }
-    payload_str = json.dumps(signature_payload, sort_keys=True, default=str)
-    cache_key = hashlib.md5(payload_str.encode("utf-8")).hexdigest()[:12]
-    return cache_dir / f"processed_{dataset_tag}_{cache_key}.pt"
-
-
-def load_or_process_data(cfg, raw_data, dataset_tag='bidmc'):
-    cache_cfg = _cfg_get(cfg, "cache", {}) or {}
-    use_cache = cache_cfg.get("use_preprocessed", True)
-    cache_path = build_preprocess_cache_path(cfg, dataset_tag)
-
-    if use_cache and cache_path.exists():
-        logger.info(f"Loading preprocessed data from cache: {cache_path}")
-        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-        return cached["processed_data"]
-
-    logger.info(f"Preprocessing raw data for {dataset_tag} (cache miss or disabled).")
-    processed = process_data(cfg, raw_data, dataset_name=dataset_tag)
-
-    if use_cache:
-        torch.save({"processed_data": processed}, cache_path)
-        logger.info(f"Saved preprocessed cache to: {cache_path}")
-    return processed
-
-
-def maybe_save_preprocess_visuals(cfg, subject_id, ppg, ppg_denoised, ppg_filtered, ppg_cliped, freq_segments, breath_segments):
-    artifacts_cfg = _cfg_get(cfg, "artifacts", {}) or {}
-    if not artifacts_cfg.get("save_preprocess_visuals", True):
-        return
-
-    max_subjects = int(artifacts_cfg.get("max_subject_visuals", 10))
-    try:
-        if int(subject_id) > max_subjects:
-            return
-    except Exception:
-        pass
-
-    out_dir = get_artifact_root(cfg) / "preprocess" / str(subject_id)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    n = min(len(ppg), 125 * 15)
-    fig, axs = plt.subplots(4, 1, figsize=(12, 10), sharex=True)
-    axs[0].plot(ppg[:n]); axs[0].set_title("原始 PPG 信号")
-    axs[1].plot(ppg_denoised[:n]); axs[1].set_title("去噪后 PPG 信号")
-    axs[2].plot(ppg_filtered[:n]); axs[2].set_title("带通滤波后 PPG 信号")
-    axs[3].plot(ppg_cliped[:n]); axs[3].set_title("异常值处理后 PPG 信号")
-    axs[3].set_xlabel("采样点")
-    fig.tight_layout()
-    fig.savefig(out_dir / "pipeline_timeseries.png", dpi=150)
-    plt.close(fig)
-
-    if len(freq_segments) > 0:
-        fig2, axs2 = plt.subplots(2, 1, figsize=(12, 7))
-        axs2[0].plot(np.asarray(ppg_cliped)[:125 * 60])
-        axs2[0].set_title("示例片段（60秒）")
-        axs2[1].imshow(np.asarray(freq_segments[0]), aspect='auto', origin='lower', cmap='viridis')
-        axs2[1].set_title(f"时频图（目标呼吸值≈{float(np.asarray(breath_segments[0]).mean()):.2f}）")
-        axs2[1].set_xlabel("时间步")
-        axs2[1].set_ylabel("频率通道")
-        fig2.tight_layout()
-        fig2.savefig(out_dir / "segment_scalogram.png", dpi=150)
-        plt.close(fig2)
-
-
-def save_training_curves_from_csv(csv_log_dir, output_dir):
-    metrics_file = Path(csv_log_dir) / "metrics.csv"
-    if not metrics_file.exists():
-        logger.warning(f"未找到训练指标文件: {metrics_file}")
-        return
-
-    df = pd.read_csv(metrics_file)
-    if df.empty:
-        logger.warning(f"训练指标为空，跳过绘图: {metrics_file}")
-        return
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    epoch_df = df.dropna(subset=["epoch"]).copy()
-    if epoch_df.empty:
-        logger.warning(f"日志中没有按 epoch 汇总的指标，跳过绘图: {metrics_file}")
-        return
-
-    epoch_df["epoch"] = epoch_df["epoch"].astype(int)
-    grouped = epoch_df.groupby("epoch", as_index=False).last()
-
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-
-    if "train_loss_epoch" in grouped.columns:
-        axes[0].plot(grouped["epoch"], grouped["train_loss_epoch"], label="训练损失", marker="o")
-    if "val_loss_epoch" in grouped.columns:
-        axes[0].plot(grouped["epoch"], grouped["val_loss_epoch"], label="验证损失", marker="s")
-    axes[0].set_title("训练与验证损失曲线")
-    axes[0].set_xlabel("Epoch")
-    axes[0].set_ylabel("Loss")
-    axes[0].legend()
-    axes[0].grid(alpha=0.3)
-
-    metric_name = None
-    if "val/MAE" in grouped.columns:
-        metric_name = "val/MAE"
-    elif "val_MAE" in grouped.columns:
-        metric_name = "val_MAE"
-    if metric_name:
-        axes[1].plot(grouped["epoch"], grouped[metric_name], label="验证 MAE", color="#d62728", marker="o")
-        axes[1].set_ylabel("MAE")
-    axes[1].set_title("验证集 MAE 变化")
-    axes[1].set_xlabel("Epoch")
-    axes[1].legend()
-    axes[1].grid(alpha=0.3)
-
-    fig.tight_layout()
-    fig.savefig(output_dir / "训练曲线.png", dpi=180)
-    plt.close(fig)
-
-def summarize_fold_results(all_fold_results):
-    rows = []
-    for fold_result in all_fold_results:
-        metrics = fold_result["test_results"]
-        rows.append({
-            "fold_id": fold_result["fold_id"],
-            "test/MAE": float(metrics.get("test/MAE", np.nan)),
-            "test/PCC": float(metrics.get("test/PCC", np.nan)),
-            "test/MSE": float(metrics.get("test/MSE", np.nan)),
-        })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df, {}
-
-    summary = {
-        "mae_mean": float(df["test/MAE"].mean()),
-        "mae_std": float(df["test/MAE"].std(ddof=0)),
-        "pcc_mean": float(df["test/PCC"].mean()),
-        "pcc_std": float(df["test/PCC"].std(ddof=0)),
-        "mse_mean": float(df["test/MSE"].mean()),
-        "mse_std": float(df["test/MSE"].std(ddof=0)),
-    }
-    return df, summary
-
-
-def save_cv_summary_and_plot(all_fold_results, output_dir, run_name):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    fold_df, summary = summarize_fold_results(all_fold_results)
-    if fold_df.empty:
-        logger.warning(f"{run_name}: no fold results to summarize.")
-        return
-
-    fold_df.to_csv(output_dir / f"{run_name}_fold_metrics.csv", index=False)
-    pd.DataFrame([{"run": run_name, **summary}]).to_csv(output_dir / f"{run_name}_summary.csv", index=False)
-
-    fig, ax1 = plt.subplots(figsize=(10, 5))
-    x = fold_df["fold_id"].to_numpy()
-    ax1.plot(x, fold_df["test/MAE"], marker="o", label="MAE", color="#1f77b4")
-    ax1.set_xlabel("Fold")
-    ax1.set_ylabel("MAE", color="#1f77b4")
-    ax1.tick_params(axis="y", labelcolor="#1f77b4")
-    ax1.grid(alpha=0.3)
-
-    ax2 = ax1.twinx()
-    ax2.plot(x, fold_df["test/PCC"], marker="s", label="PCC", color="#d62728")
-    ax2.set_ylabel("PCC", color="#d62728")
-    ax2.tick_params(axis="y", labelcolor="#d62728")
-
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="best")
-    ax1.set_title(f"{run_name}: 5折测试指标")
-
-    fig.tight_layout()
-    fig.savefig(output_dir / f"{run_name}_cv_metrics.png", dpi=180)
-    plt.close(fig)
-
-
-def run_training_and_report(cfg, run_label, processed_data, processed_capnobase_ssl, processed_data_capnobase):
-    cv_splits = create_folds(processed_data, n_splits=5, seed=cfg.seed)
-    logger.info(f"[{run_label}] Created folds: {cv_splits}")
-
-    all_test_subjects = set()
-    for fold in cv_splits:
-        all_test_subjects.update(fold["test_subjects"])
-
-    all_subjects = set(processed_data.keys())
-    missing_subjects = all_subjects - all_test_subjects
-    extra_subjects = all_test_subjects - all_subjects
-
-    print(f"[{run_label}] ✅ Total subjects: {len(all_subjects)}")
-    print(f"[{run_label}] ✅ Subjects covered in test sets: {len(all_test_subjects)}")
-    print(f"[{run_label}] 🧩 Missing subjects in test folds: {missing_subjects if missing_subjects else 'None'}")
-    print(f"[{run_label}] ⚠️ Unexpected subjects: {extra_subjects if extra_subjects else 'None'}")
-
-    all_fold_results = train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_data_capnobase)
-
-    artifact_dir = get_artifact_root(cfg) / "training" / run_label
-    save_cv_summary_and_plot(all_fold_results, artifact_dir, run_name=run_label)
-
-    _, summary = summarize_fold_results(all_fold_results)
-    print(f"[{run_label}] Average MAE across folds: {summary.get('mae_mean', float('nan')):.4f} ± {summary.get('mae_std', float('nan')):.4f}")
-    print(f"[{run_label}] Average PCC across folds: {summary.get('pcc_mean', float('nan')):.4f} ± {summary.get('pcc_std', float('nan')):.4f}")
-
-    return all_fold_results, summary
-
 
 def set_seed(seed):
     np.random.seed(seed)
@@ -399,17 +161,6 @@ def load_files_capnobase(path,subjects):
 def read_data(path):
     # Code to read data goes here
     raw_data = {}
-
-    # Support both:
-    # 1) path/data_root/bidmc
-    # 2) path/bidmc (directly pointing to bidmc folder)
-    if os.path.basename(os.path.normpath(path)).lower() == "bidmc":
-        subjects = load_subjects_bidmc(path)
-        if subjects:
-            raw_data = load_files_bidmc(path, subjects)
-            logger.info(f"Loaded BIDMC subjects: {len(subjects)} from direct path {path}")
-        return raw_data
-
     for dataset_name in os.listdir(path):
         dataset_path = os.path.join(path,dataset_name)
         if not os.path.isdir(dataset_path):
@@ -2095,9 +1846,6 @@ def process_data(cfg, raw_data, dataset_name='bidmc'):
         # )
 
         processed_data[subject_id] = (ppg_segments, rr_segments, freq_segments, ppg_segments_ssl, breath_segments)
-        maybe_save_preprocess_visuals(
-            cfg, subject_id, ppg, ppg_denoised, ppg_filtered, ppg_cliped, freq_segments, breath_segments
-        )
         # logger.info(f"processed data is {processed_data}")
         
         
@@ -2228,58 +1976,39 @@ def create_balanced_folds(processed_data, n_splits=5):
     return cv_splits
 
 
-def create_folds(processed_data, n_splits=5, seed=42):
-    """
-    Subject-level k-fold CV:
-    - each subject appears in test set exactly once
-    - validation set is split from training subjects only
-    """
+def create_folds(processed_data, n_splits=10, seed=42):
+
+    # Fix random seeds for reproducibility
     np.random.seed(seed)
     random.seed(seed)
+    all_subjects = set(processed_data.keys())
+    subjects_array = np.array(sorted(all_subjects))
+    # print(f"in create_folds: {all_subjects}")
+    # Shuffle subjects
+    shuffled_indices = np.random.permutation(len(list(all_subjects)))
+    shuffled_subjects = subjects_array[shuffled_indices]
+    
+    trainval_subjects, test_subjects = train_test_split(
+        shuffled_subjects,
+        test_size=0.10
 
-    all_subjects = sorted(processed_data.keys())
-    subjects_array = np.array(all_subjects)
-    num_subjects = len(subjects_array)
-
-    if num_subjects == 0:
-        raise ValueError(
-            "No processed subjects found. Please verify dataset files under cfg.data.path "
-            "(expected BIDMC folders/files) and check preprocessing cache configuration."
-        )
-
-    if num_subjects < 3:
-        raise ValueError(
-            f"At least 3 subjects are required to build train/val/test splits, got {num_subjects}."
-        )
-
-    effective_splits = min(n_splits, num_subjects)
-    if effective_splits != n_splits:
-        logger.warning(
-            f"Requested n_splits={n_splits}, but only {num_subjects} subjects are available. "
-            f"Using n_splits={effective_splits}."
-        )
-
-    kfold = KFold(n_splits=effective_splits, shuffle=True, random_state=seed)
-    if len(subjects_array) < n_splits:
-        raise ValueError(f"Number of subjects ({len(subjects_array)}) must be >= n_splits ({n_splits}).")
-
-    kfold = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    )
+    # Create k-fold splits
+    kfold = KFold(n_splits=n_splits, shuffle=False, random_state=None)  # Already shuffled
     cv_splits = []
-
-    for fold_id, (train_val_indices, test_indices) in enumerate(kfold.split(subjects_array), start=1):
-        train_val_subjects = subjects_array[train_val_indices].tolist()
-        test_subjects = subjects_array[test_indices].tolist()
-
-        if len(train_val_subjects) < 2:
-            raise ValueError("Not enough subjects in train_val split to build validation set.")
-
-        val_size = max(1, int(round(len(train_val_subjects) * 0.2)))
-        val_size = min(val_size, len(train_val_subjects) - 1)
-
-        fold_rng = random.Random(seed + fold_id)
-        val_subjects = fold_rng.sample(train_val_subjects, val_size)
-        val_subject_set = set(val_subjects)
-        train_subjects = [s for s in train_val_subjects if s not in val_subject_set]
+    # for fold_id, (train_val_indices, test_indices) in enumerate(kfold.split(shuffled_subjects)):
+    #     train_val_subjects = shuffled_subjects[train_val_indices].tolist()
+    #     test_subjects = shuffled_subjects[test_indices].tolist()
+    for fold_id, (train_indices, val_indices) in enumerate(kfold.split(trainval_subjects)):
+        train_subjects = trainval_subjects[train_indices].tolist()
+        val_subjects = trainval_subjects[val_indices].tolist()
+        
+        # n_val_subjects = max(1, int(len(train_val_subjects) * 0.2))
+        # # n_val_subjects = len(test_subjects)
+        # random.seed(seed + fold_id)  # make per-fold val split deterministic
+        # val_subjects = random.sample(train_val_subjects, n_val_subjects)
+        # train_subjects = [s for s in train_val_subjects if s not in val_subjects]
+        
 
         test_set = set(test_subjects)
         val_set = set(val_subjects)
@@ -2289,25 +2018,25 @@ def create_folds(processed_data, n_splits=5, seed=42):
         overlap_test_train = test_set & train_set
         overlap_val_train = val_set & train_set
 
-        logger.info(f"Fold {fold_id} overlap between test and val: {overlap_test_val}")
-        logger.info(f"Fold {fold_id} overlap between test and train: {overlap_test_train}")
-        logger.info(f"Fold {fold_id} overlap between validation and train: {overlap_val_train}")
+        logger.info(f"Fold {fold_id+1} overlap between test and val: {overlap_test_val}")
+        logger.info(f"Fold {fold_id+1} overlap between test and train: {overlap_test_train}")
+        logger.info(f"Fold {fold_id+1} overlap between validation and train: {overlap_val_train}")
 
         union = train_set | val_set | test_set
-        coverage = union == set(all_subjects)
-        missing_subjects = set(all_subjects) - union if not coverage else set()
+        coverage = union == all_subjects
+        missing_subjects = all_subjects - union if not coverage else set()
 
-        logger.info(f"Fold {fold_id} covers all subjects: {coverage}")
-        logger.info(f"Fold {fold_id} missing subjects: {missing_subjects}")
+        logger.info(f"Fold {fold_id+1} covers all subjects: {coverage}")
+        logger.info(f"Fold {fold_id+1} missing subjects: {missing_subjects}")
 
         cv_splits.append({
             "train_subjects": train_subjects,
             "val_subjects": val_subjects,
             "test_subjects": test_subjects,
-            "fold_id": fold_id,
+            "fold_id": fold_id+1
         })
-
     return cv_splits
+
 def create_data_splits(cfg, cv_split, processed_data, processed_data_capnobase):
 
     train_subjects = cv_split["train_subjects"]
@@ -3078,12 +2807,12 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
         # logger.info(f"\nSTEP 2: Analyzing AUGMENTED data for Fold {fold_id}...")
         # analyze_fold_distribution_after_augmentation(fold_id, fold_data)
         if cfg.training.ablation_mode == 'freq_only':
-            train_dataset = PPGRRDataset(cfg, fold_data['train_freq'], fold_data['train_rr'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
+            train_dataset = PPGRRDataset(cfg,fold_data['train_freq'], fold_data['train_breath'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
         else:
-            train_dataset = PPGRRDataset(cfg, fold_data['train_ppg'], fold_data['train_rr'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
+            train_dataset = PPGRRDataset(cfg,fold_data['train_ppg'], fold_data['train_breath'], fold_data['train_freq'], fold_data['train_breath'], augment=cfg.training.use_augmentation)
 
-        val_dataset = PPGRRDataset(cfg, fold_data['val_ppg'], fold_data['val_rr'], fold_data['val_freq'], fold_data['val_breath'], augment=False)
-        test_dataset = PPGRRDataset(cfg, fold_data['test_ppg'], fold_data['test_rr'], fold_data['test_freq'], fold_data['test_breath'], augment=False)
+        val_dataset = PPGRRDataset(cfg,fold_data['val_freq'], fold_data['val_rr'], fold_data['val_freq'], fold_data['val_breath'], augment=False)
+        test_dataset = PPGRRDataset(cfg,fold_data['test_freq'], fold_data['test_rr'], fold_data['test_freq'], fold_data['test_breath'], augment=False)
 
         # fold_file = f"{cfg.data_dir}/fold_{cv_split['fold_id']}.pt"
         # if cfg.training.ablation_mode == 'freq_only':
@@ -3195,7 +2924,7 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
             ssl_trainer = pl.Trainer(
                 max_epochs=cfg.ssl.max_epochs,
                 accelerator="auto",
-                strategy=resolve_trainer_strategy(cfg.hardware.devices),
+                strategy='ddp_find_unused_parameters_true',
                 devices=cfg.hardware.devices,
                 logger=ssl_logger,
                 callbacks=[ssl_checkpoint_callback, TQDMProgressBar(leave=True)],
@@ -3308,22 +3037,18 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
             name=cfg.logging.experiment_name,
             version=f'fold_{cv_split["fold_id"]}'
         )
-        csv_logger = CSVLogger(
-            save_dir=cfg.logging.log_dir,
-            name=cfg.logging.experiment_name,
-            version=f'fold_{cv_split["fold_id"]}_csv'
-        )
         callbacks = setup_callbacks(cfg, fold_id, tblogger)
         
 
         profiler = SimpleProfiler(dirpath=f"profiles/fold_{fold_id}", filename="profiler_summary.txt")  # Saves to file
+        ddp_strategy = DDPStrategy(find_unused_parameters=False)
         fine_tune_trainer = pl.Trainer(max_epochs=cfg.training.max_epochs,
                              accelerator="auto",
                              devices=cfg.hardware.devices,
-                             strategy=resolve_trainer_strategy(cfg.hardware.devices),
+                             strategy='ddp_find_unused_parameters_true',
                             #  detect_anomaly=True,
                              callbacks=callbacks,
-                             logger=[tblogger, csv_logger],
+                             logger=tblogger,
                              enable_progress_bar=True,
                              log_every_n_steps=1,
                              gradient_clip_val=cfg.training.gradient_clip_val,
@@ -3331,18 +3056,28 @@ def train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_dat
                              profiler=profiler,
                              benchmark=False
                              )
-        model = RRLightningModule(cfg)
+        ckpt_dir = Path(f"logs/freqonly_v149/fold_{fold_id}/checkpoints")
 
-        fine_tune_trainer.fit(model, data_module)
+        ckpt_files = list(ckpt_dir.glob(f"best-checkpoint-fold{fold_id}-*.ckpt"))
+
+        assert len(ckpt_files) == 1, f"Expected 1 best checkpoint, found {len(ckpt_files)}"
+
+        ckpt_path = ckpt_files[0]
+
+        model = RRLightningModule.load_from_checkpoint(
+            ckpt_path,
+            cfg=cfg
+        )
+        # model = RRLightningModule(cfg)
+        
+        # fine_tune_trainer.fit(model, data_module)
         # Write profiler summary to file
         # os.makedirs("profiles", exist_ok=True)
         # summary = profiler.summary()
         # with open("profiles/profiler_summary.txt", "w") as f:
         #     f.write(summary)
-        test_reults = fine_tune_trainer.test(datamodule=data_module, ckpt_path="best")
-
-        artifact_curve_dir = get_artifact_root(cfg) / "training" / f"fold_{fold_id}"
-        save_training_curves_from_csv(csv_logger.log_dir, artifact_curve_dir)
+        # test_reults = fine_tune_trainer.test(model, datamodule=data_module, ckpt_path="best")
+        test_reults = fine_tune_trainer.test(model, datamodule=data_module)
         all_fold_results.append({
             "fold_id": fold_id,
             "test_results": test_reults[0]
@@ -3381,17 +3116,11 @@ def main(cfg: DictConfig):
     # exit()
     print(raw_data.keys())
     print(len(raw_data.keys()))
-    processed_data = load_or_process_data(cfg, raw_data, dataset_tag="bidmc")
+    processed_data = process_data(cfg, raw_data)
 
 
     print(f"processed data length: {len(processed_data)}")
     print(f"processed data for subjects")
-
-    if len(processed_data) == 0:
-        logger.error("未读取到任何可训练受试者，请检查 data.path、原始数据目录结构以及缓存文件。")
-        logger.error(f"当前 data.path: {cfg.data.path}")
-        logger.error("可先确认 data 目录下是否存在 BIDMC 数据，再运行：python src/main.py ...")
-        return
     
     processed_data_capnobase = None
     if cfg.training.use_capno:
@@ -3406,7 +3135,7 @@ def main(cfg: DictConfig):
         # Add capno subjects
         for subject, (ppg, breath) in raw_data_capnobase.items():
             combined[f"capno_{subject}"] = (ppg, rr_temp, breath)
-        processed_data_capnobase = load_or_process_data(cfg, combined, dataset_tag="capnobase")
+        processed_data_capnobase = process_data(cfg, combined)
 
     count_zero = 0
     segment_counts = {}
@@ -3556,66 +3285,42 @@ def main(cfg: DictConfig):
         logger.info("Skipping CapnoBase dataset loading as per config.")
 
 
-    baseline_models = _cfg_get(cfg.training, "baseline_models", []) or []
+    # cv_splits = create_balanced_folds(processed_data, n_splits=5)
+    cv_splits = create_folds(processed_data, n_splits=5)
+    logger.info(f"Created folds: {cv_splits}")
 
-    print("\n========== 主模型训练（5折交叉验证）==========")
-    _, main_summary = run_training_and_report(
-        cfg,
-        run_label=f"main_{cfg.training.model_name}",
-        processed_data=processed_data,
-        processed_capnobase_ssl=processed_capnobase_ssl,
-        processed_data_capnobase=processed_data_capnobase,
-    )
 
-    comparison_rows = [{
-        "run": f"main_{cfg.training.model_name}",
-        "model_name": cfg.training.model_name,
-        **main_summary,
-    }]
+    # Collect all test subjects across folds
+    all_test_subjects = set()
+    for fold in cv_splits:
+        all_test_subjects.update(fold["test_subjects"])
 
-    original_model_name = cfg.training.model_name
-    original_use_ssl = cfg.training.use_ssl_pretraining
+    # Collect all subjects in the dataset
+    all_subjects = set(processed_data.keys())
 
-    for baseline_model in baseline_models:
-        print(f"\n========== 基线模型训练（{baseline_model}）==========")
-        cfg.training.model_name = baseline_model
-        cfg.training.use_ssl_pretraining = False
+    # Check coverage
+    missing_subjects = all_subjects - all_test_subjects
+    extra_subjects = all_test_subjects - all_subjects
 
-        _, baseline_summary = run_training_and_report(
-            cfg,
-            run_label=f"baseline_{baseline_model}",
-            processed_data=processed_data,
-            processed_capnobase_ssl=None,
-            processed_data_capnobase=processed_data_capnobase,
-        )
+    print(f"✅ Total subjects: {len(all_subjects)}")
+    print(f"✅ Subjects covered in test sets: {len(all_test_subjects)}")
+    print(f"🧩 Missing subjects in test folds: {missing_subjects if missing_subjects else 'None'}")
+    print(f"⚠️ Unexpected subjects: {extra_subjects if extra_subjects else 'None'}")
+    # processed_data = None
+    all_fold_results = train(cfg, cv_splits, processed_data, processed_capnobase_ssl, processed_data_capnobase)
+    
+    for fold_result in all_fold_results:
+        logger.info(f"Fold {fold_result['fold_id']} test results: {fold_result['test_results']}")
 
-        comparison_rows.append({
-            "run": f"baseline_{baseline_model}",
-            "model_name": baseline_model,
-            **baseline_summary,
-        })
+    # Summarize all fold results
 
-    cfg.training.model_name = original_model_name
-    cfg.training.use_ssl_pretraining = original_use_ssl
-
-    comparison_df = pd.DataFrame(comparison_rows)
-    compare_dir = get_artifact_root(cfg) / "training" / "comparisons"
-    compare_dir.mkdir(parents=True, exist_ok=True)
-    comparison_df.to_csv(compare_dir / "model_comparison.csv", index=False)
-
-    if not comparison_df.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        ax.bar(comparison_df["run"], comparison_df["mae_mean"], yerr=comparison_df["mae_std"], capsize=5, color="#4c72b0")
-        ax.set_ylabel("MAE (mean ± std)")
-        ax.set_title("主模型与基线模型 5 折结果对比")
-        ax.grid(axis="y", alpha=0.3)
-        plt.xticks(rotation=20, ha="right")
-        fig.tight_layout()
-        fig.savefig(compare_dir / "model_comparison_mae.png", dpi=180)
-        plt.close(fig)
-
-    print("\nTraining completed!")
-    print(comparison_df)
+    print(f"\nTraining completed!")
+    print(f"all fold results: {all_fold_results}")
+    all_maes = [fold_result['test_results']['test/MAE'] for fold_result in all_fold_results]
+    all_pcc = [fold_result['test_results']['test/PCC'] for fold_result in all_fold_results]
+    print(f"Average MAE across folds: {np.mean(all_maes):.4f} ± {np.std(all_maes):.4f}")
+    print(f"Average PCC across folds: {np.mean(all_pcc):.4f} ± {np.std(all_pcc):.4f}")
+    print("Hello, World!")
 
 
 if __name__ == "__main__":

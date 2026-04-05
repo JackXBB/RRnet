@@ -17,7 +17,6 @@ data:
 
 training:
   model_name: "Linear" # Model architecture to use options: ["LSTMRR", "RWKV", "RWKVTime", "RWKVTimeOPT"]
-  baseline_models: ["LSTMRR"] # Baseline models trained with the same 5-fold protocol for comparison
   batch_size: 64 # Batch size for training
   learning_rate: 1e-3 # Learning rate for the optimizer
   optimizer: "adamw" # Optimizer type options: ["adam", "adamw", "sgd"]
@@ -64,11 +63,3 @@ ssl:
   max_epochs: 1
   use_capnobase: False
   use_bidmc: False
-cache:
-  use_preprocessed: True
-  dir: "data/preprocessed"
-
-artifacts:
-  output_dir: "artifacts"
-  save_preprocess_visuals: True
-  max_subject_visuals: 10
